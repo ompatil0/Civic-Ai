@@ -1,0 +1,55 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Get user's role from the users collection
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    // Helper: Check if the user is authenticated and has the "authority" role
+    function isAuthority() {
+      return request.auth != null && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserRole() == "authority";
+    }
+
+    // Users rules: users can read and update only their own document
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Issues rules
+    match /issues/{issueId} {
+      // Citizens can read only their own issues, authorities can read all
+      allow read: if request.auth != null && (
+        isAuthority() || resource.data.reporterId == request.auth.uid
+      );
+
+      // Citizens can create issues where reporterId is their UID and status is "processing"
+      allow create: if request.auth != null && 
+        request.resource.data.reporterId == request.auth.uid &&
+        request.resource.data.status == "processing";
+
+      // Updates are restricted:
+      // 1. Authorities can update any issue details
+      // 2. Unauthenticated server-side API (request.auth == null) is permitted to process the issue:
+      //    It can transition status from "processing" to "open" and write AI-analyzed fields.
+      //    It must not touch officer-assigned fields (department, assignedOfficer, assignedOfficerName, assignedOfficerId, assignedAt, officerNotes).
+      allow update: if (
+        (request.auth != null && isAuthority()) ||
+        (
+          request.auth == null &&
+          resource.data.status == "processing" &&
+          request.resource.data.status == "open" &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'department', 'assignedOfficer', 'assignedOfficerName', 'assignedOfficerId', 'assignedAt', 'officerNotes'
+          ])
+        )
+      );
+
+      // Deletions are restricted to authorities only
+      allow delete: if request.auth != null && isAuthority();
+    }
+  }
+}
