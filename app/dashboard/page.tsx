@@ -3,13 +3,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /* eslint-disable react-hooks/exhaustive-deps */
 
-import { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/providers/auth-provider";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import {
   ShieldCheck,
+  Shield,
   AlertTriangle,
   Clock,
   CheckCircle,
@@ -22,6 +23,7 @@ import {
   Calendar,
   Sparkles,
   User,
+  Users,
   Loader2,
   X,
   Map as MapIcon,
@@ -33,9 +35,11 @@ import {
   ClipboardList
 } from "lucide-react";
 import { db } from "@/lib/firestore";
-import { collection, onSnapshot, updateDoc, doc, serverTimestamp } from "firebase/firestore";
-import { APIProvider, Map, Marker, useMap } from "@vis.gl/react-google-maps";
+import { collection, onSnapshot, updateDoc, doc, serverTimestamp, query, orderBy, limit, where } from "firebase/firestore";
+import { APIProvider, Map, Marker, useMap, InfoWindow, useApiLoadingStatus } from "@vis.gl/react-google-maps";
 import Header from "@/components/Header";
+import { createAuditLog } from "@/lib/audit";
+import SuperAdminPanel from "@/components/SuperAdminPanel";
 
 interface CivicIssue {
   id: string;
@@ -77,6 +81,7 @@ interface CivicIssue {
 }
 
 // Subcomponent to handle Heatmap rendering safely inside Google Maps
+// Subcomponent to handle Heatmap rendering safely inside Google Maps
 interface HeatmapLayerProps {
   points: { lat: number; lng: number; weight?: number }[];
   onError: (err: Error) => void;
@@ -94,9 +99,10 @@ function HeatmapLayer({ points, onError }: HeatmapLayerProps) {
         throw new Error("Google Maps Visualization library is not loaded.");
       }
 
-      const googlePoints = points.map(
-        (p) => new window.google.maps.LatLng(p.lat, p.lng)
-      );
+      const googlePoints = points.map((p) => ({
+        location: new window.google.maps.LatLng(p.lat, p.lng),
+        weight: p.weight ?? 1,
+      }));
 
       heatmap = new (window.google.maps.visualization.HeatmapLayer as any)({
         data: googlePoints,
@@ -117,6 +123,204 @@ function HeatmapLayer({ points, onError }: HeatmapLayerProps) {
   }, [map, points, onError]);
 
   return null;
+}
+
+// Custom severity SVG pins (Low: green, Medium: yellow, High: orange, Critical: red)
+const getSeverityMarkerPin = (sev?: string) => {
+  let color = "#10b981"; // Low (green)
+  if (sev === "Critical") color = "#ef4444"; // Critical (red)
+  else if (sev === "High") color = "#f97316"; // High (orange)
+  else if (sev === "Medium") color = "#eab308"; // Medium (yellow)
+
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="36" height="36">
+      <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z" fill="${color}" stroke="#ffffff" stroke-width="1.5"/>
+    </svg>
+  `;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg.trim())}`;
+};
+
+// Safe Google Map wrapper that handles loading states and failures gracefully without crashing
+interface SafeGoogleMapProps {
+  children?: React.ReactNode;
+  center: { lat: number; lng: number };
+  zoom: number;
+  onCenterChanged?: (ev: any) => void;
+  onZoomChanged?: (ev: any) => void;
+  mapId?: string;
+  disableDefaultUI?: boolean;
+  className?: string;
+  mapTypeControl?: boolean;
+  fullscreenControl?: boolean;
+}
+
+function SafeGoogleMap({ children, ...props }: SafeGoogleMapProps) {
+  const status = useApiLoadingStatus();
+
+  if (status === "FAILED") {
+    return (
+      <div className="flex flex-col items-center justify-center p-8 bg-slate-950 aspect-square lg:aspect-[4/3] text-slate-500 border border-slate-900 rounded-xl text-center w-full h-full">
+        <p className="font-bold text-red-400 text-sm">Google Maps is currently unavailable.</p>
+        <p className="text-xs text-slate-400 mt-2 max-w-[280px]">
+          Location features will continue to work using GPS coordinates.
+        </p>
+      </div>
+    );
+  }
+
+  if (status === "LOADING") {
+    return (
+      <div className="flex flex-col items-center justify-center bg-slate-950 aspect-square lg:aspect-[4/3] w-full h-full border border-slate-900 rounded-xl animate-pulse">
+        <Loader2 className="h-8 w-8 text-indigo-500 animate-spin mb-2" />
+        <p className="text-xs text-slate-400">Loading Control Center Map...</p>
+      </div>
+    );
+  }
+
+  return (
+    <Map {...props}>
+      {children}
+    </Map>
+  );
+}
+
+// AutoBoundsFitter component using LatLngBounds to fit viewport dynamically when issues load/change
+function AutoBoundsFitter({ issues }: { issues: CivicIssue[] }) {
+  const map = useMap();
+  const prevCountRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (!map || issues.length === 0) return;
+
+    // Only update bounds when count of issues changes (representing creation or deletion)
+    // to prevent disrupting the user's pan/zoom while editing details.
+    if (issues.length === prevCountRef.current) return;
+    prevCountRef.current = issues.length;
+
+    const bounds = new window.google.maps.LatLngBounds();
+    let hasPoints = false;
+    issues.forEach((issue) => {
+      if (issue.latitude && issue.longitude) {
+        bounds.extend({ lat: issue.latitude, lng: issue.longitude });
+        hasPoints = true;
+      }
+    });
+
+    if (hasPoints) {
+      const timer = setTimeout(() => {
+        map.fitBounds(bounds);
+      }, 200);
+      return () => clearTimeout(timer);
+    }
+  }, [map, issues]);
+
+  return null;
+}
+
+// Memoized SingleMarker to prevent unnecessary marker rerenders
+interface SingleMarkerProps {
+  issue: CivicIssue;
+  iconUrl: string;
+  onClick: () => void;
+  setMarkerRef: (key: string, marker: google.maps.Marker | null) => void;
+}
+
+const SingleMarker = React.memo(({ issue, iconUrl, onClick, setMarkerRef }: SingleMarkerProps) => {
+  const position = useMemo(() => ({ lat: issue.latitude, lng: issue.longitude }), [issue.latitude, issue.longitude]);
+  const icon = useMemo(() => ({
+    url: iconUrl,
+    scaledSize: new window.google.maps.Size(32, 32),
+  }), [iconUrl]);
+
+  return (
+    <Marker
+      position={position}
+      ref={(m) => setMarkerRef(issue.id, m)}
+      title={issue.title}
+      icon={icon}
+      onClick={onClick}
+    />
+  );
+}, (prevProps, nextProps) => {
+  return (
+    prevProps.issue.id === nextProps.issue.id &&
+    prevProps.issue.latitude === nextProps.issue.latitude &&
+    prevProps.issue.longitude === nextProps.issue.longitude &&
+    prevProps.issue.title === nextProps.issue.title &&
+    prevProps.issue.severity === nextProps.issue.severity &&
+    prevProps.iconUrl === nextProps.iconUrl
+  );
+});
+SingleMarker.displayName = "SingleMarker";
+
+// Official Google Maps MarkerClusterer Integration
+import { MarkerClusterer } from "@googlemaps/markerclusterer";
+
+interface MarkerClustererComponentProps {
+  issues: CivicIssue[];
+  onMarkerClick: (issue: CivicIssue) => void;
+  activeMarkerRef: (key: string, marker: google.maps.Marker | null) => void;
+}
+
+function MarkerClustererComponent({ issues, onMarkerClick, activeMarkerRef }: MarkerClustererComponentProps) {
+  const map = useMap();
+  const [markers, setMarkers] = useState<{ [key: string]: google.maps.Marker }>({});
+  const clusterer = useRef<MarkerClusterer | null>(null);
+
+  // Initialize MarkerClusterer
+  useEffect(() => {
+    if (!map) return;
+    if (!clusterer.current) {
+      clusterer.current = new MarkerClusterer({
+        map,
+      });
+    }
+    return () => {
+      if (clusterer.current) {
+        clusterer.current.clearMarkers();
+        clusterer.current = null;
+      }
+    };
+  }, [map]);
+
+  // Sync markers with the clusterer
+  useEffect(() => {
+    if (!clusterer.current) return;
+    clusterer.current.clearMarkers();
+    clusterer.current.addMarkers(Object.values(markers));
+  }, [markers]);
+
+  // Handler to register markers
+  const setMarkerRef = useCallback((key: string, marker: google.maps.Marker | null) => {
+    activeMarkerRef(key, marker);
+    if (marker) {
+      setMarkers((prev) => {
+        if (prev[key] === marker) return prev;
+        return { ...prev, [key]: marker };
+      });
+    } else {
+      setMarkers((prev) => {
+        if (!prev[key]) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    }
+  }, [activeMarkerRef]);
+
+  return (
+    <>
+      {issues.map((issue) => (
+        <SingleMarker
+          key={issue.id}
+          issue={issue}
+          iconUrl={getSeverityMarkerPin(issue.severity)}
+          onClick={() => onMarkerClick(issue)}
+          setMarkerRef={setMarkerRef}
+        />
+      ))}
+    </>
+  );
 }
 
 export default function DashboardPage() {
@@ -141,6 +345,7 @@ export default function DashboardPage() {
   const [mapZoom, setMapZoom] = useState<number>(12);
   const [isHeatmapView, setIsHeatmapView] = useState<boolean>(false);
   const [heatmapError, setHeatmapError] = useState<string | null>(null);
+  const [infoWindowIssue, setInfoWindowIssue] = useState<CivicIssue | null>(null);
 
   // AI Summary states
   const [aiSummary, setAiSummary] = useState<string>("");
@@ -154,6 +359,25 @@ export default function DashboardPage() {
   const [statusValue, setStatusValue] = useState("");
   const [updatingTicket, setUpdatingTicket] = useState(false);
 
+  // Tab State
+  const [dashboardTab, setDashboardTab] = useState<"operations" | "admin">("operations");
+
+  // Real-time statistics from users
+  const [userStats, setUserStats] = useState({
+    totalUsers: 0,
+    totalCitizens: 0,
+    totalAuthorities: 0,
+    onlineAuthorities: 0,
+  });
+
+  // Real-time Audit Logs
+  const [recentLogs, setRecentLogs] = useState<any[]>([]);
+  const [logsLoading, setLogsLoading] = useState(true);
+
+  // Selected Issue Audit Logs State
+  const [selectedIssueLogs, setSelectedIssueLogs] = useState<any[]>([]);
+  const [issueLogsLoading, setIssueLogsLoading] = useState(false);
+
   useEffect(() => {
     const timer = setTimeout(() => {
       setMounted(true);
@@ -165,11 +389,114 @@ export default function DashboardPage() {
     if (!authLoading) {
       if (!user) {
         router.replace("/login");
-      } else if (role !== "authority") {
+      } else if (role !== "authority" && role !== "super_admin") {
         router.replace("/report");
       }
     }
   }, [user, role, authLoading, router]);
+
+  // Real-time stats listener for user counts
+  useEffect(() => {
+    if (role !== "authority" && role !== "super_admin") return;
+    const usersRef = collection(db, "users");
+    const unsubscribe = onSnapshot(
+      usersRef, 
+      (snapshot) => {
+        let total = 0;
+        let citizens = 0;
+        let authorities = 0;
+        let onlineAuths = 0;
+
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data();
+          total++;
+          if (data.role === "citizen") {
+            citizens++;
+          } else if (data.role === "authority" || data.role === "super_admin") {
+            authorities++;
+            if (data.isOnline) {
+              onlineAuths++;
+            }
+          }
+        });
+
+        setUserStats({
+          totalUsers: total,
+          totalCitizens: citizens,
+          totalAuthorities: authorities,
+          onlineAuthorities: onlineAuths,
+        });
+      }, 
+      (error) => {
+        console.error("Error listening to users stats:", error);
+      }
+    );
+    return () => unsubscribe();
+  }, [role]);
+
+  // Real-time recent audit logs listener
+  useEffect(() => {
+    if (role !== "authority" && role !== "super_admin") return;
+    const logsRef = collection(db, "auditLogs");
+    const q = query(logsRef, orderBy("timestamp", "desc"), limit(15));
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const logsData: any[] = [];
+        snapshot.forEach((docSnap) => {
+          logsData.push({ id: docSnap.id, ...docSnap.data() });
+        });
+        setRecentLogs(logsData);
+        setLogsLoading(false);
+      },
+      (error) => {
+        console.error("Error listening to audit logs:", error);
+        setLogsLoading(false);
+      }
+    );
+    return () => unsubscribe();
+  }, [role]);
+
+  // Real-time selected issue audit logs listener
+  useEffect(() => {
+    if (!selectedIssue) {
+      const timer = setTimeout(() => {
+        setSelectedIssueLogs([]);
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+    
+    const loadingTimer = setTimeout(() => {
+      setIssueLogsLoading(true);
+    }, 0);
+    const logsRef = collection(db, "auditLogs");
+    const q = query(
+      logsRef,
+      where("issueId", "==", selectedIssue.id),
+      orderBy("timestamp", "asc")
+    );
+    
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const logsData: any[] = [];
+        snapshot.forEach((docSnap) => {
+          logsData.push({ id: docSnap.id, ...docSnap.data() });
+        });
+        setSelectedIssueLogs(logsData);
+        setIssueLogsLoading(false);
+      },
+      (error) => {
+        console.error("Error listening to selected issue logs:", error);
+        setIssueLogsLoading(false);
+      }
+    );
+    
+    return () => {
+      clearTimeout(loadingTimer);
+      unsubscribe();
+    };
+  }, [selectedIssue]);
 
   // Real-time Firestore subscription to `"issues"`
   useEffect(() => {
@@ -313,7 +640,84 @@ export default function DashboardPage() {
         setStatusValue("assigned");
       }
 
+      // Draft audit logs for changes
+      const logsToCreate: Promise<any>[] = [];
+      const performer = {
+        performedByUid: user?.uid || "",
+        performedByName: user?.displayName || "Authority User",
+        performedByEmail: user?.email || "",
+        performedByRole: role || "authority"
+      };
+
+      // 1. Status change
+      if (updates.status !== selectedIssue.status) {
+        logsToCreate.push(createAuditLog({
+          issueId: selectedIssue.id,
+          action: "Status Changed",
+          ...performer,
+          before: { status: selectedIssue.status },
+          after: { status: updates.status },
+          metadata: { oldStatus: selectedIssue.status, newStatus: updates.status }
+        }));
+        
+        if (updates.status === "Resolved") {
+          logsToCreate.push(createAuditLog({
+            issueId: selectedIssue.id,
+            action: "Issue Resolved",
+            ...performer,
+            before: { status: selectedIssue.status },
+            after: { status: "Resolved" }
+          }));
+        }
+        
+        if (updates.status === "assigned" && selectedIssue.status !== "assigned") {
+          logsToCreate.push(createAuditLog({
+            issueId: selectedIssue.id,
+            action: "Assigned",
+            ...performer,
+            before: { status: selectedIssue.status },
+            after: { status: "assigned" }
+          }));
+        }
+      }
+
+      // 2. Department change
+      if (assignedDepartment !== (selectedIssue.department || "")) {
+        logsToCreate.push(createAuditLog({
+          issueId: selectedIssue.id,
+          action: "Department Changed",
+          ...performer,
+          before: { department: selectedIssue.department || null },
+          after: { department: assignedDepartment },
+          metadata: { oldDepartment: selectedIssue.department || null, newDepartment: assignedDepartment }
+        }));
+      }
+
+      // 3. Officer change
+      if (assignedOfficer !== (selectedIssue.assignedOfficer || "")) {
+        logsToCreate.push(createAuditLog({
+          issueId: selectedIssue.id,
+          action: "Officer Assigned",
+          ...performer,
+          before: { assignedOfficer: selectedIssue.assignedOfficer || null },
+          after: { assignedOfficer: assignedOfficer },
+          metadata: { oldOfficer: selectedIssue.assignedOfficer || null, newOfficer: assignedOfficer }
+        }));
+      }
+
+      // 4. Resolution Notes / Officer notes change
+      if (officerNotes && officerNotes !== (selectedIssue.officerNotes || "")) {
+        logsToCreate.push(createAuditLog({
+          issueId: selectedIssue.id,
+          action: "Resolution Added",
+          ...performer,
+          before: { officerNotes: selectedIssue.officerNotes || null },
+          after: { officerNotes: officerNotes }
+        }));
+      }
+
       await updateDoc(docRef, updates);
+      await Promise.all(logsToCreate).catch((err) => console.error("Audit logs failed:", err));
       toast.success("Ticket database updated successfully!");
       
       // Merge values into the drawer view locally to keep layout reactive
@@ -418,7 +822,7 @@ export default function DashboardPage() {
     .map((r) => ({
       lat: r.latitude,
       lng: r.longitude,
-      weight: r.severity === "Critical" ? 4 : r.severity === "High" ? 3 : r.severity === "Medium" ? 2 : 1,
+      weight: r.priorityScore !== undefined ? r.priorityScore : 10,
     }));
 
   const getSeverityColor = (sev?: string) => {
@@ -443,13 +847,23 @@ export default function DashboardPage() {
     }
   };
 
-  const getSeverityMarkerPin = (sev?: string) => {
-    switch (sev) {
-      case "Critical": return "https://maps.google.com/mapfiles/ms/icons/red-dot.png";
-      case "High": return "https://maps.google.com/mapfiles/ms/icons/orange-dot.png";
-      case "Medium": return "https://maps.google.com/mapfiles/ms/icons/yellow-dot.png";
-      default: return "https://maps.google.com/mapfiles/ms/icons/green-dot.png";
+  const getRoleBadge = (roleStr: string) => {
+    switch (roleStr) {
+      case "super_admin":
+        return "text-purple-400 bg-purple-950/40 border border-purple-500/30";
+      case "authority":
+        return "text-indigo-400 bg-indigo-950/40 border border-indigo-500/30";
+      case "citizen":
+        return "text-slate-400 bg-slate-900 border border-slate-800";
+      default:
+        return "text-slate-500 bg-slate-950 border border-slate-900";
     }
+  };
+
+  const formatTimestamp = (ts: any) => {
+    if (!ts) return "Syncing...";
+    const date = ts.toDate ? ts.toDate() : new Date(ts);
+    return date.toLocaleString();
   };
 
   return (
@@ -487,65 +901,147 @@ export default function DashboardPage() {
           </button>
         </div>
 
-        {/* Live Summary Statistics Cards */}
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
-          {/* Card: Total */}
-          <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-450">Total Reports</span>
-              <TrendingUp className="h-4 w-4 text-indigo-400" />
-            </div>
-            <p className="mt-2 text-2xl font-extrabold text-white">{loading ? "..." : totalCount}</p>
+        {/* Tab Toggle for Super Admin */}
+        {role === "super_admin" && (
+          <div className="flex bg-slate-900/50 p-1 rounded-xl border border-slate-800 self-start text-xs font-semibold max-w-xs">
+            <button
+              onClick={() => setDashboardTab("operations")}
+              className={`px-4 py-2 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                dashboardTab === "operations" ? "bg-indigo-600 text-white shadow" : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <Activity className="h-3.5 w-3.5" />
+              Operations Dashboard
+            </button>
+            <button
+              onClick={() => setDashboardTab("admin")}
+              className={`px-4 py-2 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                dashboardTab === "admin" ? "bg-indigo-600 text-white shadow" : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <Shield className="h-3.5 w-3.5" />
+              Super Admin Console
+            </button>
           </div>
-          
-          {/* Card: Open */}
-          <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Open Issues</span>
-              <AlertCircle className="h-4 w-4 text-blue-400" />
+        )}
+
+        {/* Live Operational Statistics Cards */}
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
+            {/* Card: Pending Issues (Open) */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Pending Issues</span>
+                <AlertCircle className="h-4 w-4 text-blue-400" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-blue-400">{loading ? "..." : openCount}</p>
             </div>
-            <p className="mt-2 text-2xl font-extrabold text-blue-400">{loading ? "..." : openCount}</p>
+
+            {/* Card: Assigned Issues */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Assigned Issues</span>
+                <UserCheck className="h-4 w-4 text-indigo-400" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-indigo-400">{loading ? "..." : assignedCount}</p>
+            </div>
+
+            {/* Card: In Progress */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">In Progress</span>
+                <Clock className="h-4 w-4 text-amber-400" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-amber-400">{loading ? "..." : inProgressCount}</p>
+            </div>
+
+            {/* Card: Resolved Today */}
+            {(() => {
+              const resolvedTodayCount = issues.filter(r => {
+                if (r.status !== "Resolved" && r.status !== "resolved") return false;
+                const resolvedTime = r.resolvedAt?.toDate ? r.resolvedAt.toDate() : (r.updatedAt?.toDate ? r.updatedAt.toDate() : null);
+                if (!resolvedTime) return false;
+                const today = new Date();
+                return resolvedTime.getDate() === today.getDate() &&
+                       resolvedTime.getMonth() === today.getMonth() &&
+                       resolvedTime.getFullYear() === today.getFullYear();
+              }).length;
+              return (
+                <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Resolved Today</span>
+                    <CheckCircle className="h-4 w-4 text-emerald-400" />
+                  </div>
+                  <p className="mt-2 text-2xl font-extrabold text-emerald-400">{loading ? "..." : resolvedTodayCount}</p>
+                </div>
+              );
+            })()}
+
+            {/* Card: Critical Issues */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Critical Issues</span>
+                <AlertTriangle className="h-4 w-4 text-red-400 animate-pulse" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-red-400">{loading ? "..." : criticalCount}</p>
+            </div>
+
+            {/* Card: Total Reports */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-450">Total Reports</span>
+                <TrendingUp className="h-4 w-4 text-indigo-400" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-white">{loading ? "..." : totalCount}</p>
+            </div>
           </div>
 
-          {/* Card: Assigned */}
-          <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Assigned</span>
-              <UserCheck className="h-4 w-4 text-indigo-400" />
+          {/* User Metrics Row */}
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            {/* Card: Total Users */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-450">Total Users</span>
+                <Users className="h-4 w-4 text-slate-400" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-white">{loading ? "..." : userStats.totalUsers}</p>
             </div>
-            <p className="mt-2 text-2xl font-extrabold text-indigo-400">{loading ? "..." : assignedCount}</p>
-          </div>
 
-          {/* Card: In Progress */}
-          <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">In Progress</span>
-              <Clock className="h-4 w-4 text-amber-400" />
+            {/* Card: Total Citizens */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Total Citizens</span>
+                <User className="h-4 w-4 text-slate-400" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-slate-300">{loading ? "..." : userStats.totalCitizens}</p>
             </div>
-            <p className="mt-2 text-2xl font-extrabold text-amber-400">{loading ? "..." : inProgressCount}</p>
-          </div>
 
-          {/* Card: Resolved */}
-          <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Resolved</span>
-              <CheckCircle className="h-4 w-4 text-emerald-400" />
+            {/* Card: Total Authorities */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Total Authorities</span>
+                <Shield className="h-4 w-4 text-indigo-400" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-indigo-400">{loading ? "..." : userStats.totalAuthorities}</p>
             </div>
-            <p className="mt-2 text-2xl font-extrabold text-emerald-400">{loading ? "..." : resolvedCount}</p>
-          </div>
 
-          {/* Card: Critical */}
-          <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Critical</span>
-              <AlertTriangle className="h-4 w-4 text-red-400 animate-pulse" />
+            {/* Card: Online Authorities */}
+            <div className="relative overflow-hidden rounded-xl border border-slate-900 bg-slate-900/25 p-4 backdrop-blur-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-455">Online Authorities</span>
+                <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+              </div>
+              <p className="mt-2 text-2xl font-extrabold text-emerald-400">{loading ? "..." : userStats.onlineAuthorities}</p>
             </div>
-            <p className="mt-2 text-2xl font-extrabold text-red-400">{loading ? "..." : criticalCount}</p>
           </div>
         </div>
 
-        {/* AI Operations Summary Panel */}
-        <div className="rounded-2xl border border-indigo-900/35 bg-indigo-950/10 p-6 backdrop-blur-md relative overflow-hidden">
+        {dashboardTab === "admin" && role === "super_admin" ? (
+          <SuperAdminPanel />
+        ) : (
+          <>
+            {/* AI Operations Summary Panel */}
+            <div className="rounded-2xl border border-indigo-900/35 bg-indigo-950/10 p-6 backdrop-blur-md relative overflow-hidden">
           <div className="absolute top-0 right-0 h-40 w-40 rounded-full bg-indigo-600/5 blur-[64px] pointer-events-none" />
           
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-indigo-900/25 pb-4 mb-4">
@@ -712,6 +1208,79 @@ export default function DashboardPage() {
           </div>
         </div>
 
+        {/* Recent Audit Logs Panel */}
+        <div className="rounded-xl border border-slate-900 bg-slate-900/10 p-6 backdrop-blur-sm space-y-4">
+          <div className="flex items-center justify-between border-b border-slate-900/50 pb-3">
+            <div className="flex items-center gap-2 text-indigo-400">
+              <ClipboardList className="h-5 w-5" />
+              <h3 className="font-bold text-base text-white">Recent Audit Logs</h3>
+            </div>
+            <span className="text-[10px] text-slate-500">Live operational updates</span>
+          </div>
+
+          <div className="max-h-[280px] overflow-y-auto pr-1 space-y-2 text-xs">
+            {logsLoading ? (
+              <div className="text-center text-slate-500 py-6 flex items-center justify-center gap-2">
+                <Loader2 className="h-4 w-4 animate-spin text-indigo-400" />
+                <span>Loading recent logs...</span>
+              </div>
+            ) : recentLogs.length === 0 ? (
+              <div className="text-center text-slate-500 py-6">No recent audit logs found.</div>
+            ) : (
+              recentLogs.map((log) => (
+                <div key={log.id} className="p-3 rounded-lg border border-slate-900 bg-slate-950/40 flex flex-col md:flex-row md:items-center justify-between gap-3 text-slate-350 hover:bg-slate-900/10 transition-all">
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="font-semibold text-slate-200">{log.action}</span>
+                      <span className="text-[10px] text-slate-500">• by {log.performedByName}</span>
+                      <span className={`rounded-full px-2 py-0.2 text-[9px] font-extrabold capitalize ${getRoleBadge(log.performedByRole)}`}>
+                        {log.performedByRole}
+                      </span>
+                    </div>
+                    {log.issueId && (
+                      <div className="text-[10px] text-slate-550 flex items-center gap-1">
+                        <span>Issue ID:</span>
+                        <span className="font-mono text-[9px] text-indigo-400 cursor-pointer" onClick={() => {
+                          const matchingIssue = issues.find(r => r.id === log.issueId);
+                          if (matchingIssue) {
+                            setSelectedIssue(matchingIssue);
+                            setInfoWindowIssue(matchingIssue);
+                            if (matchingIssue.latitude && matchingIssue.longitude) {
+                              setMapCenter({ lat: matchingIssue.latitude, lng: matchingIssue.longitude });
+                              setMapZoom(16);
+                            }
+                          } else {
+                            toast.error("Issue details not found in active list");
+                          }
+                        }}>
+                          {log.issueId}
+                        </span>
+                      </div>
+                    )}
+                    {log.before && (
+                      <div className="text-[9px] text-slate-550 flex items-center gap-1">
+                        <span className="text-red-500/80 font-bold uppercase">Before:</span>
+                        <span className="font-mono">{JSON.stringify(log.before)}</span>
+                      </div>
+                    )}
+                    {log.after && (
+                      <div className="text-[9px] text-slate-550 flex items-center gap-1">
+                        <span className="text-emerald-500/80 font-bold uppercase">After:</span>
+                        <span className="font-mono">{JSON.stringify(log.after)}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="text-[10px] text-slate-500 text-left md:text-right shrink-0">
+                    <div>{log.timestamp ? formatTimestamp(log.timestamp) : "Just now"}</div>
+                    <div className="text-[9px] text-slate-650 truncate max-w-[150px]">{log.performedByEmail}</div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
         {/* Dashboard Grid Map / List Layout */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           
@@ -811,13 +1380,14 @@ export default function DashboardPage() {
                     key={issue.id}
                     onClick={() => {
                       setSelectedIssue(issue);
+                      setInfoWindowIssue(issue);
                       if (issue.latitude && issue.longitude) {
                         setMapCenter({ lat: issue.latitude, lng: issue.longitude });
                         setMapZoom(16);
                       }
                     }}
                     className={`group relative overflow-hidden rounded-xl border p-4 transition-all cursor-pointer ${
-                      selectedIssue?.id === issue.id
+                      (selectedIssue?.id === issue.id || infoWindowIssue?.id === issue.id)
                         ? "border-indigo-500 bg-indigo-950/15"
                         : "border-slate-900 bg-slate-900/20 hover:border-slate-800 hover:bg-slate-900/30"
                     }`}
@@ -934,21 +1504,28 @@ export default function DashboardPage() {
               )}
 
               {/* Map Canvas */}
-              {mounted && process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ? (
-                <div className="w-full rounded-xl overflow-hidden border border-slate-900 aspect-square lg:aspect-[4/3] bg-slate-950 relative">
+              {mounted && process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY && 
+               process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY !== "YOUR_API_KEY" && 
+               process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY.trim() !== "" ? (
+                <div className="w-full rounded-xl overflow-hidden border border-slate-900 aspect-square md:aspect-[4/3] min-h-[350px] md:min-h-[450px] bg-slate-950 relative">
                   <APIProvider 
                     apiKey={process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY} 
                     libraries={['visualization']}
                   >
-                    <Map
+                    <SafeGoogleMap
                       center={mapCenter}
                       zoom={mapZoom}
                       onCenterChanged={(ev) => setMapCenter(ev.detail.center)}
                       onZoomChanged={(ev) => setMapZoom(ev.detail.zoom)}
                       mapId="civic_ai_control_center_map"
                       disableDefaultUI={false}
+                      mapTypeControl={true}
+                      fullscreenControl={true}
                       className="w-full h-full"
                     >
+                      {/* Auto Bounds Fitting */}
+                      <AutoBoundsFitter issues={issues} />
+
                       {/* Render Heatmap View */}
                       {isHeatmapView && !heatmapError ? (
                         <HeatmapLayer
@@ -960,42 +1537,86 @@ export default function DashboardPage() {
                           }}
                         />
                       ) : (
-                        // Render standard colored Markers
-                        issues
-                          .filter((r) => r.latitude && r.longitude)
-                          .map((issue) => (
-                            <Marker
-                              key={issue.id}
-                              position={{ lat: issue.latitude, lng: issue.longitude }}
-                              title={issue.title}
-                              icon={{
-                                url: getSeverityMarkerPin(issue.severity),
-                                scaledSize: new window.google.maps.Size(32, 32),
-                              }}
-                              onClick={() => {
-                                setSelectedIssue(issue);
-                                setMapCenter({ lat: issue.latitude, lng: issue.longitude });
-                                setMapZoom(15);
-                              }}
-                            />
-                          ))
+                        // Render official Marker Clusterer Component
+                        <MarkerClustererComponent
+                          issues={issues.filter((r) => r.latitude && r.longitude)}
+                          onMarkerClick={(issue) => {
+                            setInfoWindowIssue(issue);
+                            if (issue.latitude && issue.longitude) {
+                              setMapCenter({ lat: issue.latitude, lng: issue.longitude });
+                            }
+                          }}
+                          activeMarkerRef={() => {}}
+                        />
                       )}
-                    </Map>
+
+                      {/* Custom Marker Info Window */}
+                      {infoWindowIssue && (
+                        <InfoWindow
+                          position={{ lat: infoWindowIssue.latitude, lng: infoWindowIssue.longitude }}
+                          onCloseClick={() => setInfoWindowIssue(null)}
+                        >
+                          <div className="p-3 text-slate-200 bg-slate-900 rounded-lg border border-slate-800 font-sans max-w-[280px] space-y-2 text-xs">
+                            <div>
+                              <h4 className="font-bold text-white text-sm line-clamp-1">{infoWindowIssue.title}</h4>
+                              <span className="text-[10px] text-indigo-400 font-semibold">{infoWindowIssue.category || "General"}</span>
+                            </div>
+                            
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className={`px-2 py-0.5 rounded-full text-[9px] font-extrabold border ${
+                                infoWindowIssue.severity === "Critical" ? "text-red-400 bg-red-950/40 border-red-500/30" :
+                                infoWindowIssue.severity === "High" ? "text-orange-400 bg-orange-950/40 border-orange-500/30" :
+                                infoWindowIssue.severity === "Medium" ? "text-yellow-400 bg-yellow-950/40 border-yellow-500/30" :
+                                "text-emerald-400 bg-emerald-950/40 border-emerald-500/30"
+                              }`}>
+                                {infoWindowIssue.severity || "Low"}
+                              </span>
+                              <span className="bg-slate-950 text-slate-300 border border-slate-800 text-[9px] font-bold px-1.5 py-0.5 rounded">
+                                Priority: {infoWindowIssue.priorityScore || 0}
+                              </span>
+                              <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded capitalize ${
+                                infoWindowIssue.status === "Resolved" || infoWindowIssue.status === "resolved" ? "text-emerald-400 bg-emerald-950/30" :
+                                infoWindowIssue.status === "In Progress" || infoWindowIssue.status === "in-progress" ? "text-amber-400 bg-amber-950/30" :
+                                "text-blue-400 bg-blue-950/30"
+                              }`}>
+                                {infoWindowIssue.status || "Open"}
+                              </span>
+                            </div>
+
+                            <div className="text-[10px] text-slate-400">
+                              Reported: {infoWindowIssue.createdAt ? formatTimestamp(infoWindowIssue.createdAt) : "Pending"}
+                            </div>
+
+                            <button
+                              onClick={() => {
+                                setSelectedIssue(infoWindowIssue);
+                                setInfoWindowIssue(null);
+                              }}
+                              className="w-full mt-2 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-1.5 text-[10px] transition-all cursor-pointer text-center"
+                            >
+                              Open Details
+                            </button>
+                          </div>
+                        </InfoWindow>
+                      )}
+                    </SafeGoogleMap>
                   </APIProvider>
                 </div>
               ) : (
-                <div className="flex flex-col items-center justify-center p-12 text-center rounded-xl bg-slate-950 aspect-square lg:aspect-[4/3] text-slate-500 border border-slate-900">
+                <div className="flex flex-col items-center justify-center p-12 text-center rounded-xl bg-slate-950 aspect-square md:aspect-[4/3] min-h-[350px] md:min-h-[450px] text-slate-500 border border-slate-900 w-full h-full">
                   <MapPin className="h-8 w-8 text-slate-700 mb-2" />
-                  <p className="text-xs font-semibold">Google Maps is not initialized</p>
-                  <p className="text-[10px] text-slate-650 mt-1 max-w-[280px]">
-                    Please configure the NEXT_PUBLIC_GOOGLE_MAPS_API_KEY environment variable to visualize geo-location issues.
+                  <p className="text-xs font-bold text-red-400">Google Maps is currently unavailable.</p>
+                  <p className="text-[10px] text-slate-400 mt-2 max-w-[280px]">
+                    Location features will continue to work using GPS coordinates.
                   </p>
                 </div>
               )}
             </div>
           </div>
         </div>
-      </main>
+      </>
+    )}
+  </main>
 
       {/* Sidebar / Issue Detail Drawer Panel */}
       <AnimatePresence>
@@ -1217,72 +1838,138 @@ export default function DashboardPage() {
                 </span>
 
                 <div className="relative pl-4 border-l border-slate-850 space-y-5 text-xs text-slate-400">
-                  {/* Step: Created */}
-                  <div className="relative">
-                    <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-indigo-500 border border-slate-950" />
-                    <div className="font-semibold text-slate-200">Ticket Registered</div>
-                    <div className="text-[10px] text-slate-500 mt-0.5">
-                      {selectedIssue.createdAt?.toDate ? selectedIssue.createdAt.toDate().toLocaleString() : "Syncing..."}
-                    </div>
-                  </div>
+                  {/* Step 1: Created */}
+                  {(() => {
+                    const log = selectedIssueLogs.find((l) => l.action === "Issue Created");
+                    const isActive = !!log || !!selectedIssue?.createdAt;
+                    const timestamp = log?.timestamp || selectedIssue?.createdAt;
+                    return (
+                      <div className={`relative ${isActive ? "text-slate-200" : "text-slate-600"}`}>
+                        <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-indigo-500" : "bg-slate-800"}`} />
+                        <div className="font-semibold">Ticket Created</div>
+                        {isActive ? (
+                          <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                            <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Citizen"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "citizen")}`}>{log?.performedByRole || "citizen"}</span></div>
+                            <div><span className="text-slate-550">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                            <div><span className="text-slate-550">Action:</span> Ticket registered successfully.</div>
+                            {log?.after && (
+                              <div className="text-[9px] text-slate-500 font-mono mt-0.5"><span className="text-emerald-500/80 font-bold uppercase">Details:</span> {JSON.stringify(log.after)}</div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-slate-600 mt-0.5">Pending Ticket registration</div>
+                        )}
+                      </div>
+                    );
+                  })()}
 
-                  {/* Step: Analyzed */}
-                  {selectedIssue.analyzedAt && (
-                    <div className="relative animate-fadeIn">
-                      <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-violet-400 border border-slate-950" />
-                      <div className="font-semibold text-slate-200">AI Visual Scan Executed</div>
-                      <div className="text-[10px] text-slate-500 mt-0.5">
-                        Category and Severity mapped to &quot;{selectedIssue.category}&quot; with {selectedIssue.confidence || 90}% confidence.
+                  {/* Step 2: AI Processed */}
+                  {(() => {
+                    const log = selectedIssueLogs.find((l) => l.action === "AI Analysis Completed");
+                    const isActive = !!log || !!selectedIssue?.analyzedAt;
+                    const timestamp = log?.timestamp || selectedIssue?.analyzedAt;
+                    return (
+                      <div className={`relative ${isActive ? "text-slate-200" : "text-slate-600"}`}>
+                        <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-violet-400" : "bg-slate-800"}`} />
+                        <div className="font-semibold">AI Processed</div>
+                        {isActive ? (
+                          <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                            <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Gemini AI"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "system")}`}>{log?.performedByRole || "system"}</span></div>
+                            <div><span className="text-slate-550">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                            <div><span className="text-slate-550">Action:</span> Issue auto-analyzed and classified.</div>
+                            {log?.after && (
+                              <div className="text-[9px] text-slate-550 font-mono mt-0.5"><span className="text-emerald-500/80 font-bold uppercase">Classification:</span> {JSON.stringify(log.after)}</div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-slate-600 mt-0.5">Waiting for AI assessment</div>
+                        )}
                       </div>
-                      <div className="text-[10px] text-slate-650">
-                        {selectedIssue.analyzedAt.toDate ? selectedIssue.analyzedAt.toDate().toLocaleString() : ""}
-                      </div>
-                    </div>
-                  )}
+                    );
+                  })()}
 
-                  {/* Step: Assigned */}
-                  {selectedIssue.assignedAt && (
-                    <div className="relative animate-fadeIn">
-                      <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-blue-400 border border-slate-950" />
-                      <div className="font-semibold text-slate-200">Department Assigned</div>
-                      <div className="text-[10px] text-slate-500 mt-0.5">
-                        Routed to {selectedIssue.department || "Public Works"}.
-                        {(selectedIssue.assignedOfficerName || selectedIssue.assignedOfficer) && ` Dispatched: ${selectedIssue.assignedOfficerName || selectedIssue.assignedOfficer}`}
-                        {selectedIssue.assignedOfficerId && ` (ID: ${selectedIssue.assignedOfficerId})`}
+                  {/* Step 3: Assigned */}
+                  {(() => {
+                    const log = [...selectedIssueLogs].reverse().find(
+                      (l) => l.action === "Assigned" || l.action === "Officer Assigned" || l.action === "Department Changed"
+                    );
+                    const isActive = !!log || !!selectedIssue?.assignedAt;
+                    const timestamp = log?.timestamp || selectedIssue?.assignedAt;
+                    return (
+                      <div className={`relative ${isActive ? "text-slate-200" : "text-slate-600"}`}>
+                        <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-blue-400" : "bg-slate-800"}`} />
+                        <div className="font-semibold">Assigned</div>
+                        {isActive ? (
+                          <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                            <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Dispatcher"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "authority")}`}>{log?.performedByRole || "authority"}</span></div>
+                            <div><span className="text-slate-550">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                            <div><span className="text-slate-550">Action:</span> Routed to {selectedIssue?.department || "Operations"} Department.</div>
+                            {log?.before && (
+                              <div className="text-[9px] text-slate-550 font-mono"><span className="text-red-500/70 font-bold uppercase">Before:</span> {JSON.stringify(log.before)}</div>
+                            )}
+                            {log?.after && (
+                              <div className="text-[9px] text-slate-550 font-mono"><span className="text-emerald-500/80 font-bold uppercase">After:</span> {JSON.stringify(log.after)}</div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-slate-600 mt-0.5">Awaiting routing/officer assignment</div>
+                        )}
                       </div>
-                      <div className="text-[10px] text-slate-650">
-                        {selectedIssue.assignedAt.toDate ? selectedIssue.assignedAt.toDate().toLocaleString() : ""}
-                      </div>
-                    </div>
-                  )}
+                    );
+                  })()}
 
-                  {/* Step: In Progress */}
-                  {selectedIssue.inProgressAt && (
-                    <div className="relative animate-fadeIn">
-                      <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-amber-400 border border-slate-950" />
-                      <div className="font-semibold text-slate-200">Work In Progress</div>
-                      <div className="text-[10px] text-slate-500 mt-0.5">Dispatch crew performing inspection/repair.</div>
-                      <div className="text-[10px] text-slate-650">
-                        {selectedIssue.inProgressAt.toDate ? selectedIssue.inProgressAt.toDate().toLocaleString() : ""}
+                  {/* Step 4: In Progress */}
+                  {(() => {
+                    const log = selectedIssueLogs.find(
+                      (l) => l.action === "Status Changed" && (l.after?.status === "In Progress" || l.metadata?.newStatus === "In Progress")
+                    );
+                    const isActive = !!log || !!selectedIssue?.inProgressAt;
+                    const timestamp = log?.timestamp || selectedIssue?.inProgressAt;
+                    return (
+                      <div className={`relative ${isActive ? "text-slate-200" : "text-slate-600"}`}>
+                        <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-amber-400" : "bg-slate-800"}`} />
+                        <div className="font-semibold">In Progress</div>
+                        {isActive ? (
+                          <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                            <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Dispatch Crew"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "authority")}`}>{log?.performedByRole || "authority"}</span></div>
+                            <div><span className="text-slate-550">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                            <div><span className="text-slate-550">Action:</span> Repair crew dispatched to site.</div>
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-slate-600 mt-0.5">Repair queue pending</div>
+                        )}
                       </div>
-                    </div>
-                  )}
+                    );
+                  })()}
 
-                  {/* Step: Resolved */}
-                  {selectedIssue.resolvedAt && (
-                    <div className="relative animate-fadeIn">
-                      <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-emerald-500 border border-slate-950" />
-                      <div className="font-semibold text-emerald-400">Issue Resolved</div>
-                      {selectedIssue.officerNotes && (
-                        <p className="mt-1 text-[10px] text-slate-350 italic font-mono bg-slate-900/50 p-2 rounded border border-slate-850">
-                          Notes: {selectedIssue.officerNotes}
-                        </p>
-                      )}
-                      <div className="text-[10px] text-slate-600 mt-0.5">
-                        {selectedIssue.resolvedAt.toDate ? selectedIssue.resolvedAt.toDate().toLocaleString() : ""}
+                  {/* Step 5: Resolved */}
+                  {(() => {
+                    const log = [...selectedIssueLogs].reverse().find(
+                      (l) => l.action === "Issue Resolved" || l.action === "Resolution Added"
+                    );
+                    const isActive = !!log || !!selectedIssue?.resolvedAt;
+                    const timestamp = log?.timestamp || selectedIssue?.resolvedAt;
+                    return (
+                      <div className={`relative ${isActive ? "text-slate-200" : "text-slate-600"}`}>
+                        <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-emerald-500" : "bg-slate-800"}`} />
+                        <div className={`font-semibold ${isActive ? "text-emerald-450 font-bold" : ""}`}>Resolved</div>
+                        {isActive ? (
+                          <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                            <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Officer"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "authority")}`}>{log?.performedByRole || "authority"}</span></div>
+                            <div><span className="text-slate-550">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                            <div><span className="text-slate-550">Action:</span> Resolved and verified.</div>
+                            {selectedIssue?.officerNotes && (
+                              <div className="mt-1 text-[10px] text-slate-350 italic font-mono bg-slate-900/50 p-2 rounded border border-slate-850">
+                                Notes: {selectedIssue.officerNotes}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-slate-600 mt-0.5">Awaiting resolution verification</div>
+                        )}
                       </div>
-                    </div>
-                  )}
+                    );
+                  })()}
                 </div>
               </div>
 

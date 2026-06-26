@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/providers/auth-provider";
 import { db } from "@/lib/firestore";
-import { collection, query, where, onSnapshot } from "firebase/firestore";
+import { collection, query, where, onSnapshot, orderBy } from "firebase/firestore";
 import Header from "@/components/Header";
 import { Loader2, FileText, Calendar, MapPin, Sparkles, CheckCircle, X, Eye } from "lucide-react";
 
@@ -53,6 +53,68 @@ export default function MyReportsPage() {
   const [issues, setIssues] = useState<CivicIssue[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedIssue, setSelectedIssue] = useState<CivicIssue | null>(null);
+  const [selectedIssueLogs, setSelectedIssueLogs] = useState<any[]>([]);
+  const [issueLogsLoading, setIssueLogsLoading] = useState(false);
+
+  // Real-time selected issue audit logs listener
+  useEffect(() => {
+    if (!selectedIssue) {
+      const timer = setTimeout(() => {
+        setSelectedIssueLogs([]);
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+    
+    const loadingTimer = setTimeout(() => {
+      setIssueLogsLoading(true);
+    }, 0);
+    const logsRef = collection(db, "auditLogs");
+    const q = query(
+      logsRef,
+      where("issueId", "==", selectedIssue.id),
+      orderBy("timestamp", "asc")
+    );
+    
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const logsData: any[] = [];
+        snapshot.forEach((docSnap) => {
+          logsData.push({ id: docSnap.id, ...docSnap.data() });
+        });
+        setSelectedIssueLogs(logsData);
+        setIssueLogsLoading(false);
+      },
+      (error) => {
+        console.error("Error listening to selected issue logs:", error);
+        setIssueLogsLoading(false);
+      }
+    );
+    
+    return () => {
+      clearTimeout(loadingTimer);
+      unsubscribe();
+    };
+  }, [selectedIssue]);
+
+  const getRoleBadge = (roleStr: string) => {
+    switch (roleStr) {
+      case "super_admin":
+        return "text-purple-400 bg-purple-950/40 border border-purple-500/30";
+      case "authority":
+        return "text-indigo-400 bg-indigo-950/40 border border-indigo-500/30";
+      case "citizen":
+        return "text-slate-400 bg-slate-900 border border-slate-800";
+      default:
+        return "text-slate-500 bg-slate-950 border border-slate-900";
+    }
+  };
+
+  const formatTimestamp = (ts: any) => {
+    if (!ts) return "Syncing...";
+    const date = ts.toDate ? ts.toDate() : new Date(ts);
+    return date.toLocaleString();
+  };
 
   // Protected route
   useEffect(() => {
@@ -320,55 +382,138 @@ export default function MyReportsPage() {
                       </span>
 
                       <div className="relative pl-4 border-l border-slate-850 space-y-5 text-xs text-slate-400">
-                        <div className="relative">
-                          <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-indigo-500 border border-slate-950" />
-                          <div className="font-semibold text-slate-200">Ticket Registered</div>
-                          <div className="text-[10px] text-slate-500 mt-0.5">
-                            {selectedIssue.createdAt?.toDate ? selectedIssue.createdAt.toDate().toLocaleString() : ""}
-                          </div>
-                        </div>
-
-                        {selectedIssue.analyzedAt && (
-                          <div className="relative">
-                            <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-violet-400 border border-slate-950" />
-                            <div className="font-semibold text-slate-200">AI Visual Scan Executed</div>
-                            <div className="text-[10px] text-slate-500 mt-0.5">
-                              Category and Severity mapped to &quot;{selectedIssue.category}&quot; with {selectedIssue.confidence || 90}% confidence.
+                        {/* Step 1: Created */}
+                        {(() => {
+                          const log = selectedIssueLogs.find((l) => l.action === "Issue Created");
+                          const isActive = !!log || !!selectedIssue?.createdAt;
+                          const timestamp = log?.timestamp || selectedIssue?.createdAt;
+                          return (
+                            <div className={`relative ${isActive ? "text-slate-200" : "text-slate-650"}`}>
+                              <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-indigo-500" : "bg-slate-800"}`} />
+                              <div className="font-semibold">Ticket Created</div>
+                              {isActive ? (
+                                <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                                  <div><span className="text-slate-500">Performer:</span> {log?.performedByName || "Citizen"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "citizen")}`}>{log?.performedByRole || "citizen"}</span></div>
+                                  <div><span className="text-slate-500">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                                  <div><span className="text-slate-500">Action:</span> Ticket registered successfully.</div>
+                                  {log?.after && (
+                                    <div className="text-[9px] text-slate-555 font-mono mt-0.5"><span className="text-emerald-500/80 font-bold uppercase">Details:</span> {JSON.stringify(log.after)}</div>
+                                  )}
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-slate-650 mt-0.5">Pending Ticket registration</div>
+                              )}
                             </div>
-                          </div>
-                        )}
+                          );
+                        })()}
 
-                        {selectedIssue.assignedAt && (
-                          <div className="relative">
-                            <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-blue-400 border border-slate-950" />
-                            <div className="font-semibold text-slate-200">Department Assigned</div>
-                            <div className="text-[10px] text-slate-500 mt-0.5">
-                              Routed to {selectedIssue.department || "Public Works"}.
-                              {(selectedIssue.assignedOfficerName || selectedIssue.assignedOfficer) && ` Dispatched: ${selectedIssue.assignedOfficerName || selectedIssue.assignedOfficer}`}
-                              {selectedIssue.assignedOfficerId && ` (ID: ${selectedIssue.assignedOfficerId})`}
+                        {/* Step 2: AI Processed */}
+                        {(() => {
+                          const log = selectedIssueLogs.find((l) => l.action === "AI Analysis Completed");
+                          const isActive = !!log || !!selectedIssue?.analyzedAt;
+                          const timestamp = log?.timestamp || selectedIssue?.analyzedAt;
+                          return (
+                            <div className={`relative ${isActive ? "text-slate-200" : "text-slate-650"}`}>
+                              <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-violet-400" : "bg-slate-800"}`} />
+                              <div className="font-semibold">AI Processed</div>
+                              {isActive ? (
+                                <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                                  <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Gemini AI"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "system")}`}>{log?.performedByRole || "system"}</span></div>
+                                  <div><span className="text-slate-550">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                                  <div><span className="text-slate-550">Action:</span> Issue auto-analyzed and classified.</div>
+                                  {log?.after && (
+                                    <div className="text-[9px] text-slate-550 font-mono mt-0.5"><span className="text-emerald-500/80 font-bold uppercase">Classification:</span> {JSON.stringify(log.after)}</div>
+                                  )}
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-slate-650 mt-0.5">Waiting for AI assessment</div>
+                              )}
                             </div>
-                          </div>
-                        )}
+                          );
+                        })()}
 
-                        {selectedIssue.inProgressAt && (
-                          <div className="relative">
-                            <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-amber-400 border border-slate-950" />
-                            <div className="font-semibold text-slate-200">Work In Progress</div>
-                            <div className="text-[10px] text-slate-500 mt-0.5">Dispatch crew performing inspection/repair.</div>
-                          </div>
-                        )}
+                        {/* Step 3: Assigned */}
+                        {(() => {
+                          const log = [...selectedIssueLogs].reverse().find(
+                            (l) => l.action === "Assigned" || l.action === "Officer Assigned" || l.action === "Department Changed"
+                          );
+                          const isActive = !!log || !!selectedIssue?.assignedAt;
+                          const timestamp = log?.timestamp || selectedIssue?.assignedAt;
+                          return (
+                            <div className={`relative ${isActive ? "text-slate-200" : "text-slate-655"}`}>
+                              <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-blue-400" : "bg-slate-800"}`} />
+                              <div className="font-semibold">Assigned</div>
+                              {isActive ? (
+                                <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                                  <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Dispatcher"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "authority")}`}>{log?.performedByRole || "authority"}</span></div>
+                                  <div><span className="text-slate-550">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                                  <div><span className="text-slate-550">Action:</span> Routed to {selectedIssue?.department || "Operations"} Department.</div>
+                                  {log?.before && (
+                                    <div className="text-[9px] text-slate-550 font-mono"><span className="text-red-500/70 font-bold uppercase">Before:</span> {JSON.stringify(log.before)}</div>
+                                  )}
+                                  {log?.after && (
+                                    <div className="text-[9px] text-slate-550 font-mono"><span className="text-emerald-500/80 font-bold uppercase">After:</span> {JSON.stringify(log.after)}</div>
+                                  )}
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-slate-650 mt-0.5">Awaiting routing/officer assignment</div>
+                              )}
+                            </div>
+                          );
+                        })()}
 
-                        {selectedIssue.resolvedAt && (
-                          <div className="relative">
-                            <div className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-emerald-500 border border-slate-950" />
-                            <div className="font-semibold text-emerald-400">Issue Resolved</div>
-                            {selectedIssue.officerNotes && (
-                              <p className="mt-1 text-[10px] text-slate-350 italic font-mono bg-slate-900/50 p-2 rounded border border-slate-850">
-                                Resolution Notes: {selectedIssue.officerNotes}
-                              </p>
-                            )}
-                          </div>
-                        )}
+                        {/* Step 4: In Progress */}
+                        {(() => {
+                          const log = selectedIssueLogs.find(
+                            (l) => l.action === "Status Changed" && (l.after?.status === "In Progress" || l.metadata?.newStatus === "In Progress")
+                          );
+                          const isActive = !!log || !!selectedIssue?.inProgressAt;
+                          const timestamp = log?.timestamp || selectedIssue?.inProgressAt;
+                          return (
+                            <div className={`relative ${isActive ? "text-slate-200" : "text-slate-655"}`}>
+                              <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-amber-400" : "bg-slate-800"}`} />
+                              <div className="font-semibold">In Progress</div>
+                              {isActive ? (
+                                <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                                  <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Dispatch Crew"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "authority")}`}>{log?.performedByRole || "authority"}</span></div>
+                                  <div><span className="text-slate-555">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                                  <div><span className="text-slate-555">Action:</span> Repair crew dispatched to site.</div>
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-slate-650 mt-0.5">Repair queue pending</div>
+                              )}
+                            </div>
+                          );
+                        })()}
+
+                        {/* Step 5: Resolved */}
+                        {(() => {
+                          const log = [...selectedIssueLogs].reverse().find(
+                            (l) => l.action === "Issue Resolved" || l.action === "Resolution Added"
+                          );
+                          const isActive = !!log || !!selectedIssue?.resolvedAt;
+                          const timestamp = log?.timestamp || selectedIssue?.resolvedAt;
+                          return (
+                            <div className={`relative ${isActive ? "text-slate-200" : "text-slate-655"}`}>
+                              <div className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border border-slate-950 ${isActive ? "bg-emerald-500" : "bg-slate-800"}`} />
+                              <div className={`font-semibold ${isActive ? "text-emerald-450 font-bold" : ""}`}>Resolved</div>
+                              {isActive ? (
+                                <div className="text-[10px] text-slate-400 mt-1 space-y-1">
+                                  <div><span className="text-slate-550">Performer:</span> {log?.performedByName || "Officer"} <span className={`inline-block px-1.5 py-0.2 rounded text-[8px] font-bold ${getRoleBadge(log?.performedByRole || "authority")}`}>{log?.performedByRole || "authority"}</span></div>
+                                  <div><span className="text-slate-555">Time:</span> {timestamp ? formatTimestamp(timestamp) : "Pending"}</div>
+                                  <div><span className="text-slate-555">Action:</span> Resolved and verified.</div>
+                                  {selectedIssue?.officerNotes && (
+                                    <div className="mt-1 text-[10px] text-slate-350 italic font-mono bg-slate-900/50 p-2 rounded border border-slate-850">
+                                      Notes: {selectedIssue.officerNotes}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-slate-650 mt-0.5">Awaiting resolution verification</div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
                   </div>

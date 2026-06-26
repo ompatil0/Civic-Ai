@@ -23,8 +23,96 @@ import {
 } from "lucide-react";
 import { db } from "@/lib/firestore";
 import { collection, serverTimestamp, doc, setDoc, onSnapshot } from "firebase/firestore";
+import { createAuditLog } from "@/lib/audit";
 
+import { APIProvider, Map, Marker, useApiLoadingStatus } from "@vis.gl/react-google-maps";
 import Header from "@/components/Header";
+
+interface AddressDetails {
+  area: string;
+  city: string;
+  state: string;
+  country: string;
+}
+
+const parseGeocodeResult = (addressComponents: google.maps.GeocoderAddressComponent[]): AddressDetails => {
+  let area = "";
+  let city = "";
+  let state = "";
+  let country = "";
+
+  for (const component of addressComponents) {
+    const types = component.types;
+    if (types.includes("sublocality") || types.includes("sublocality_level_1") || types.includes("neighborhood")) {
+      area = component.long_name;
+    }
+    if (types.includes("locality") || types.includes("postal_town")) {
+      city = component.long_name;
+    }
+    if (types.includes("administrative_area_level_1")) {
+      state = component.long_name;
+    }
+    if (types.includes("country")) {
+      country = component.long_name;
+    }
+  }
+
+  // Fallbacks
+  if (!city) {
+    for (const component of addressComponents) {
+      if (component.types.includes("administrative_area_level_2")) {
+        city = component.long_name;
+      }
+    }
+  }
+  if (!area) {
+    area = city || "Unknown Area";
+  }
+
+  return {
+    area: area || "Unknown Area",
+    city: city || "Unknown City",
+    state: state || "Unknown State",
+    country: country || "Unknown Country",
+  };
+};
+
+interface SafeGoogleMapProps {
+  children?: React.ReactNode;
+  center: { lat: number; lng: number };
+  zoom: number;
+  mapId?: string;
+  disableDefaultUI?: boolean;
+  className?: string;
+}
+
+function SafeGoogleMap({ children, ...props }: SafeGoogleMapProps) {
+  const status = useApiLoadingStatus();
+
+  if (status === "FAILED") {
+    return (
+      <div className="rounded-xl border border-red-500/25 bg-red-950/20 p-4 text-xs text-red-400">
+        <p className="font-bold text-red-450">Google Maps is currently unavailable.</p>
+        <p className="mt-1">Location features will continue to work using GPS coordinates.</p>
+      </div>
+    );
+  }
+
+  if (status === "LOADING") {
+    return (
+      <div className="flex flex-col items-center justify-center p-8 bg-slate-950 aspect-video w-full border border-slate-900 rounded-xl animate-pulse">
+        <Loader2 className="h-6 w-6 text-indigo-500 animate-spin mb-2" />
+        <p className="text-xs text-slate-400">Loading Map View...</p>
+      </div>
+    );
+  }
+
+  return (
+    <Map {...props}>
+      {children}
+    </Map>
+  );
+}
 
 const compressImageBase64 = (
   base64Str: string,
@@ -144,6 +232,25 @@ export default function ReportPage() {
   // GPS coordinates and state
   const [gpsLoading, setGpsLoading] = useState(false);
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [addressDetails, setAddressDetails] = useState<AddressDetails | null>(null);
+
+  const reverseGeocode = async (lat: number, lng: number) => {
+    const mapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
+    if (!mapsApiKey || mapsApiKey === "YOUR_API_KEY" || mapsApiKey.trim() === "") return;
+    try {
+      const res = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${mapsApiKey}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.results && data.results[0]) {
+          setValue("location", data.results[0].formatted_address);
+          const details = parseGeocodeResult(data.results[0].address_components);
+          setAddressDetails(details);
+        }
+      }
+    } catch (e) {
+      console.error("Reverse geocoding error:", e);
+    }
+  };
 
   // Camera settings
   const [isMobile, setIsMobile] = useState(false);
@@ -208,6 +315,8 @@ export default function ReportPage() {
         setActiveIssue(data);
         if (data.status === "open") {
           toast.success("AI Processing Complete!");
+        } else if (data.status === "pending_ai") {
+          toast.info("Report submitted for manual review.");
         }
       }
     });
@@ -281,12 +390,14 @@ export default function ReportPage() {
         
         try {
           const mapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
-          if (mapsApiKey) {
+          if (mapsApiKey && mapsApiKey !== "YOUR_API_KEY" && mapsApiKey.trim() !== "") {
             const res = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}&key=${mapsApiKey}`);
             if (res.ok) {
               const data = await res.json();
               if (data.results && data.results[0]) {
                 setValue("location", data.results[0].formatted_address);
+                const details = parseGeocodeResult(data.results[0].address_components);
+                setAddressDetails(details);
               }
             }
           }
@@ -340,7 +451,14 @@ export default function ReportPage() {
       });
 
       if (!response.ok) {
-        throw new Error("Analysis failed. Please try again or fill the fields manually.");
+        let errMsg = "Analysis failed. Please try again or fill the fields manually.";
+        try {
+          const errData = await response.json();
+          if (errData && errData.message) {
+            errMsg = errData.message;
+          }
+        } catch {}
+        throw new Error(errMsg);
       }
 
       const result = await response.json();
@@ -361,7 +479,13 @@ export default function ReportPage() {
         if (ana.severity) setValue("severity", ana.severity);
         if (ana.recommended_department) setValue("department", ana.recommended_department);
         if (ana.description) setValue("description", ana.description);
-        toast.success("AI pre-fill applied!");
+
+        if (result.analysisSource === "manual-fallback") {
+          setError(result.message || "AI analysis is temporarily unavailable.");
+          toast.warning("AI unavailable. Fallback details pre-filled.");
+        } else {
+          toast.success("AI pre-fill applied!");
+        }
       }
     } catch (err: unknown) {
       console.error(err);
@@ -405,7 +529,34 @@ export default function ReportPage() {
         nearbySchool: data.nearbySchool,
         nearbyHospital: data.nearbyHospital,
         locationRisk: data.locationRisk,
+        area: addressDetails?.area || "",
+        city: addressDetails?.city || "",
+        state: addressDetails?.state || "",
+        country: addressDetails?.country || "",
       });
+
+      // Audit Log
+      if (user) {
+        await createAuditLog({
+          issueId: issueId,
+          action: "Issue Created",
+          performedByUid: user.uid,
+          performedByName: user.displayName || "Anonymous User",
+          performedByEmail: user.email || "",
+          performedByRole: "citizen",
+          after: {
+            title: data.title,
+            description: data.description,
+            location: data.location,
+            trafficRisk: data.trafficRisk,
+            nearbySchool: data.nearbySchool,
+            nearbyHospital: data.nearbyHospital,
+            locationRisk: data.locationRisk,
+            status: "processing"
+          },
+          metadata: { title: data.title }
+        }).catch(console.error);
+      }
 
       // 4. Trigger process-issue background API
       fetch("/api/process-issue", {
@@ -459,7 +610,7 @@ export default function ReportPage() {
         {/* If user submitted a ticket and it is processing/open */}
         {activeIssueId ? (
           <div className="pt-8">
-            {activeIssue && activeIssue.status === "open" ? (
+            {activeIssue && (activeIssue.status === "open" || activeIssue.status === "pending_ai") ? (
               <AnalysisResultView issue={activeIssue} onReset={handleReset} />
             ) : (
               <ProcessingPipeline />
@@ -717,6 +868,70 @@ export default function ReportPage() {
                       {errors.location && (
                         <p className="mt-1 text-xs text-red-400">{errors.location.message}</p>
                       )}
+
+                      {/* Interactive Google Map on Report Page */}
+                      {coords && (
+                        <div className="mt-4 space-y-3">
+                          <span className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
+                            Confirm Location Pin (Drag to adjust)
+                          </span>
+                          
+                          {process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY && 
+                           process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY !== "YOUR_API_KEY" && 
+                           process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY.trim() !== "" ? (
+                            <div className="w-full rounded-xl overflow-hidden border border-slate-900 aspect-video bg-slate-950 relative min-h-[220px]">
+                              <APIProvider apiKey={process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY}>
+                                <SafeGoogleMap
+                                  center={coords}
+                                  zoom={16}
+                                  mapId="civic_ai_report_map"
+                                  disableDefaultUI={true}
+                                  className="w-full h-full"
+                                >
+                                  <Marker
+                                    position={coords}
+                                    draggable={true}
+                                    onDragEnd={async (ev) => {
+                                      if (ev.latLng) {
+                                        const lat = ev.latLng.lat();
+                                        const lng = ev.latLng.lng();
+                                        setCoords({ lat, lng });
+                                        await reverseGeocode(lat, lng);
+                                      }
+                                    }}
+                                  />
+                                </SafeGoogleMap>
+                              </APIProvider>
+                            </div>
+                          ) : (
+                            <div className="rounded-xl border border-red-500/25 bg-red-950/20 p-4 text-xs text-red-400">
+                              <p className="font-bold">Google Maps is currently unavailable.</p>
+                              <p className="mt-1">Location features will continue to work using GPS coordinates.</p>
+                            </div>
+                          )}
+
+                          {addressDetails && (
+                            <div className="grid grid-cols-2 gap-3.5 mt-3 p-4 rounded-xl border border-slate-900 bg-slate-900/40 text-xs">
+                              <div>
+                                <span className="text-[10px] font-bold text-slate-550 uppercase tracking-wider block">Area</span>
+                                <span className="font-semibold text-slate-200">{addressDetails.area}</span>
+                              </div>
+                              <div>
+                                <span className="text-[10px] font-bold text-slate-550 uppercase tracking-wider block">City</span>
+                                <span className="font-semibold text-slate-200">{addressDetails.city}</span>
+                              </div>
+                              <div>
+                                <span className="text-[10px] font-bold text-slate-550 uppercase tracking-wider block">State</span>
+                                <span className="font-semibold text-slate-200">{addressDetails.state}</span>
+                              </div>
+                              <div>
+                                <span className="text-[10px] font-bold text-slate-550 uppercase tracking-wider block">Country</span>
+                                <span className="font-semibold text-slate-200">{addressDetails.country}</span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     {/* Priority Modifier Checkboxes */}
@@ -961,21 +1176,37 @@ interface AnalysisResultProps {
     recommendedDepartment?: string;
     estimatedResolution?: string;
     priorityScore?: number;
+    status?: string;
   };
   onReset: () => void;
 }
 
 function AnalysisResultView({ issue, onReset }: AnalysisResultProps) {
+  const isPendingAI = issue.status === "pending_ai";
   return (
     <div className="max-w-2xl mx-auto rounded-2xl border border-slate-900 bg-slate-900/30 p-6 md:p-8 backdrop-blur-md shadow-2xl my-12">
       <div className="text-center mb-8">
-        <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-600/10 text-emerald-400 border border-emerald-500/20">
-          <CheckCircle className="h-6 w-6" />
-        </div>
-        <h3 className="text-2xl font-bold text-white">Issue Registered & Analyzed</h3>
-        <p className="text-sm text-slate-400 mt-1">
-          Gemini has successfully cataloged and routed your ticket.
-        </p>
+        {isPendingAI ? (
+          <>
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-amber-600/10 text-amber-400 border border-amber-500/20 animate-pulse">
+              <AlertTriangle className="h-6 w-6" />
+            </div>
+            <h3 className="text-2xl font-bold text-white">Report Submitted Successfully</h3>
+            <p className="text-sm text-slate-400 mt-1">
+              AI analysis is temporarily unavailable. Your report has been submitted successfully for manual review.
+            </p>
+          </>
+        ) : (
+          <>
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-600/10 text-emerald-400 border border-emerald-500/20">
+              <CheckCircle className="h-6 w-6" />
+            </div>
+            <h3 className="text-2xl font-bold text-white">Issue Registered & Analyzed</h3>
+            <p className="text-sm text-slate-400 mt-1">
+              Gemini has successfully cataloged and routed your ticket.
+            </p>
+          </>
+        )}
       </div>
 
       {(issue.imageBase64 || issue.imageUrl) && (

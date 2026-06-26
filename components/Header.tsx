@@ -25,7 +25,8 @@ export default function Header() {
   };
 
   const isCitizen = role === "citizen";
-  const isAuthority = role === "authority";
+  const isAuthority = role === "authority" || role === "super_admin";
+  const isSuperAdmin = role === "super_admin";
 
   return (
     <>
@@ -50,7 +51,7 @@ export default function Header() {
             <span className="text-lg font-bold tracking-tight text-white animate-pulse">CivicAI</span>
             {isAuthority && (
               <span className="ml-2 rounded bg-indigo-955 border border-indigo-900 px-2 py-0.5 text-xs text-indigo-400 font-semibold shadow-inner">
-                Admin Portal
+                {isSuperAdmin ? "Super Admin" : "Admin Portal"}
               </span>
             )}
           </div>

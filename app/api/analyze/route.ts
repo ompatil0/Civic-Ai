@@ -14,6 +14,20 @@ interface InlineDataPart {
 
 type GeminiContentPart = string | TextPart | InlineDataPart;
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getFriendlyErrorMessage(error: any): string {
+  const msg = (error?.message || String(error)).toLowerCase();
+  const status = error?.status || error?.statusCode;
+  
+  if (status === 429 || msg.includes("resource_exhausted") || msg.includes("quota") || msg.includes("limit") || msg.includes("rate")) {
+    return "AI quota exceeded. Your report has been submitted successfully and will be reviewed manually.";
+  }
+  if (msg.includes("fetch") || msg.includes("connect") || msg.includes("network") || msg.includes("timeout") || msg.includes("eai_again") || msg.includes("socket")) {
+    return "Unable to connect to the AI service. Your report has been submitted for manual review.";
+  }
+  return "AI analysis is temporarily unavailable. Your report has been submitted successfully.";
+}
+
 export async function POST(req: NextRequest) {
   try {
     console.log("[DIAGNOSTIC] /api/analyze: Request received");
@@ -80,77 +94,114 @@ Return ONLY the raw JSON output. Do not wrap in markdown blocks.
 
     contents.push(textPrompt);
 
-    console.log("[DIAGNOSTIC] /api/analyze: Gemini API request started");
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      contents: contents as any,
-      config: {
-        responseMimeType: "application/json",
-      },
-    });
+    let modelUsed = "gemini-2.5-flash";
+    let responseText = "";
+    let friendlyError: string | null = null;
 
-    console.log("[DIAGNOSTIC] /api/analyze: Gemini response received");
-    const responseText = response.text;
-    if (!responseText) {
-      throw new Error("No response received from Gemini API");
-    }
-
-    // Clean up code fences or markdown blocks if present
-    let cleanText = responseText.trim();
-    if (cleanText.startsWith("```")) {
-      // Remove starting fence
-      cleanText = cleanText.replace(/^```(?:json)?\n?/i, "");
-      // Remove ending fence
-      cleanText = cleanText.replace(/\n?```$/i, "");
-    }
-    cleanText = cleanText.trim();
-
-    console.log("[DIAGNOSTIC] /api/analyze: Parsing JSON response");
-    let parsedData = null;
     try {
-      parsedData = JSON.parse(cleanText);
-      console.log("[DIAGNOSTIC] /api/analyze: JSON parsed successfully");
-    } catch (e) {
-      console.warn("JSON.parse failed. Retrying with regex cleanup.", e);
-      // Try to find any JSON-like substring
-      const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try {
-          parsedData = JSON.parse(jsonMatch[0]);
-          console.log("[DIAGNOSTIC] /api/analyze: JSON parsed via fallback regex");
-        } catch (e2) {
-          console.error("Fallback parsing failed", e2);
+      console.log("AI Model:\ngemini-2.5-flash");
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        contents: contents as any,
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
+      responseText = response.text || "";
+      if (!responseText) {
+        throw new Error("Empty response text from primary model");
+      }
+    } catch (primaryError: unknown) {
+      console.log("Primary model failed.\nSwitching to gemini-2.0-flash...");
+      modelUsed = "gemini-2.0-flash";
+      friendlyError = getFriendlyErrorMessage(primaryError);
+
+      try {
+        console.log("AI Model:\ngemini-2.0-flash");
+        const response = await ai.models.generateContent({
+          model: "gemini-2.0-flash",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          contents: contents as any,
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+        responseText = response.text || "";
+        if (!responseText) {
+          throw new Error("Empty response text from fallback model");
+        }
+      } catch (secondaryError: unknown) {
+        console.log("Both AI models failed.\nUsing manual fallback.");
+        modelUsed = "manual-fallback";
+        friendlyError = getFriendlyErrorMessage(secondaryError);
+      }
+    }
+
+    console.log(`[DIAGNOSTIC] /api/analyze: Gemini response received, modelUsed = ${modelUsed}`);
+    let parsedData = null;
+
+    if (modelUsed !== "manual-fallback" && responseText) {
+      // Clean up code fences or markdown blocks if present
+      let cleanText = responseText.trim();
+      if (cleanText.startsWith("```")) {
+        // Remove starting fence
+        cleanText = cleanText.replace(/^```(?:json)?\n?/i, "");
+        // Remove ending fence
+        cleanText = cleanText.replace(/\n?```$/i, "");
+      }
+      cleanText = cleanText.trim();
+
+      console.log("[DIAGNOSTIC] /api/analyze: Parsing JSON response");
+      try {
+        parsedData = JSON.parse(cleanText);
+        console.log("[DIAGNOSTIC] /api/analyze: JSON parsed successfully");
+      } catch (e) {
+        console.warn("JSON.parse failed. Retrying with regex cleanup.", e);
+        // Try to find any JSON-like substring
+        const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            parsedData = JSON.parse(jsonMatch[0]);
+            console.log("[DIAGNOSTIC] /api/analyze: JSON parsed via fallback regex");
+          } catch (e2) {
+            console.error("Fallback parsing failed", e2);
+          }
         }
       }
     }
 
-    if (!parsedData) {
+    if (!parsedData || modelUsed === "manual-fallback") {
       // Graceful fallback structure
       parsedData = {
-        issue_type: "Civic Issue",
+        issue_type: "Unknown",
         category: "Other",
         severity: "Medium",
-        confidence: 50,
-        description: description || "Reported civic issue requiring inspection.",
+        confidence: 0,
+        description: "AI analysis unavailable. Manual review required.",
         recommended_department: "General Administration",
-        estimated_resolution: "3-5 business days"
+        estimated_resolution: "Pending Review"
       };
     }
 
-    return NextResponse.json({ success: true, analysis: parsedData });
-  } catch (error: unknown) {
+    return NextResponse.json({
+      success: true,
+      analysis: parsedData,
+      analysisSource: modelUsed,
+      message: friendlyError
+    });
+  } catch (outerError: unknown) {
     console.error("[DIAGNOSTIC] /api/analyze: Detailed Error Stack:");
-    if (error instanceof Error) {
-      console.error(error.stack);
+    if (outerError instanceof Error) {
+      console.error(outerError.stack);
     } else {
-      console.error(error);
+      console.error(outerError);
     }
-    const errMsg = error instanceof Error ? error.message : "Failed to analyze civic issue";
+    const friendlyMsg = getFriendlyErrorMessage(outerError);
     return NextResponse.json({
       success: false,
       code: "INTERNAL_ERROR",
-      message: errMsg
+      message: friendlyMsg
     }, { status: 500 });
   }
 }

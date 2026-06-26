@@ -7,23 +7,74 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
     }
 
-    // Helper: Check if the user is authenticated and has the "authority" role
-    function isAuthority() {
+    // Helper: Check if the user is authenticated and has the "authority" or "super_admin" role
+    function isAuthorityOrAdmin() {
       return request.auth != null && 
         exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-        getUserRole() == "authority";
+        (getUserRole() == "authority" || getUserRole() == "super_admin");
     }
 
-    // Users rules: users can read and update only their own document
+    // Helper: Check if user is Super Admin
+    function isSuperAdmin() {
+      return request.auth != null && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserRole() == "super_admin";
+    }
+
+    // Helper: Check if email is active in whitelist
+    function isWhitelistedActive(email) {
+      return exists(/databases/$(database)/documents/authorizedAuthorities/$(email)) &&
+        get(/databases/$(database)/documents/authorizedAuthorities/$(email)).data.status == "active";
+    }
+
+    // Helper: Get the whitelisted role for an email
+    function getWhitelistedRole(email) {
+      return get(/databases/$(database)/documents/authorizedAuthorities/$(email)).data.role;
+    }
+
+    // Users rules
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if request.auth != null && (
+        request.auth.uid == userId || 
+        isAuthorityOrAdmin()
+      );
+      
+      allow write: if request.auth != null && (
+        isSuperAdmin() ||
+        (
+          request.auth.uid == userId &&
+          (
+            request.method == "create" ? (
+              (!isWhitelistedActive(request.resource.data.email) && request.resource.data.role == "citizen") ||
+              (isWhitelistedActive(request.resource.data.email) && request.resource.data.role == getWhitelistedRole(request.resource.data.email))
+            ) : (
+              request.resource.data.uid == resource.data.uid &&
+              request.resource.data.email == resource.data.email &&
+              request.resource.data.createdAt == resource.data.createdAt &&
+              (
+                (!isWhitelistedActive(resource.data.email) && request.resource.data.role == "citizen") ||
+                (isWhitelistedActive(resource.data.email) && request.resource.data.role == getWhitelistedRole(resource.data.email))
+              )
+            )
+          )
+        )
+      );
+    }
+
+    // Whitelist rules
+    match /authorizedAuthorities/{email} {
+      allow read: if request.auth != null && (
+        request.auth.token.email.toLowerCase() == email.toLowerCase() || 
+        isAuthorityOrAdmin()
+      );
+      allow write: if isSuperAdmin();
     }
 
     // Issues rules
     match /issues/{issueId} {
       // Citizens can read only their own issues, authorities can read all
       allow read: if request.auth != null && (
-        isAuthority() || resource.data.reporterId == request.auth.uid
+        isAuthorityOrAdmin() || resource.data.reporterId == request.auth.uid
       );
 
       // Citizens can create issues where reporterId is their UID and status is "processing"
@@ -32,12 +83,12 @@ service cloud.firestore {
         request.resource.data.status == "processing";
 
       // Updates are restricted:
-      // 1. Authorities can update any issue details
+      // 1. Authorities/Admins can update operational fields
       // 2. Unauthenticated server-side API (request.auth == null) is permitted to process the issue:
       //    It can transition status from "processing" to "open" and write AI-analyzed fields.
       //    It must not touch officer-assigned fields (department, assignedOfficer, assignedOfficerName, assignedOfficerId, assignedAt, officerNotes).
       allow update: if (
-        (request.auth != null && isAuthority()) ||
+        (request.auth != null && isAuthorityOrAdmin()) ||
         (
           request.auth == null &&
           resource.data.status == "processing" &&
@@ -48,8 +99,17 @@ service cloud.firestore {
         )
       );
 
-      // Deletions are restricted to authorities only
-      allow delete: if request.auth != null && isAuthority();
+      // Deletions are restricted to authorities and admins only
+      allow delete: if request.auth != null && isAuthorityOrAdmin();
+    }
+
+    // Audit logs rules
+    match /auditLogs/{logId} {
+      allow create: if true; // Allowed for client and server-side logs
+      allow read: if request.auth != null && (
+        isAuthorityOrAdmin() ||
+        (resource.data.issueId != null && get(/databases/$(database)/documents/issues/$(resource.data.issueId)).data.reporterId == request.auth.uid)
+      );
     }
   }
 }

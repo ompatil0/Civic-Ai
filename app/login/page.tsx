@@ -12,6 +12,7 @@ import { db } from "@/lib/firestore";
 import { signInWithEmailAndPassword, signInWithPopup, GoogleAuthProvider } from "firebase/auth";
 import { doc, getDoc, setDoc, updateDoc, serverTimestamp } from "firebase/firestore";
 import { useAuth } from "@/providers/auth-provider";
+import { createAuditLog } from "@/lib/audit";
 
 const loginSchema = zod.object({
   email: zod.string().email("Please enter a valid email address"),
@@ -36,7 +37,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     if (!authLoading && user && role) {
-      if (role === "authority") {
+      if (role === "authority" || role === "super_admin") {
         router.replace("/dashboard");
       } else {
         router.replace("/report");
@@ -47,6 +48,20 @@ export default function LoginPage() {
   const upsertUser = async (firebaseUser: import("firebase/auth").User): Promise<string> => {
     const userRef = doc(db, "users", firebaseUser.uid);
     const userSnap = await getDoc(userRef);
+    const email = firebaseUser.email || "";
+    let finalRole = "citizen";
+
+    if (email) {
+      try {
+        const whitelistRef = doc(db, "authorizedAuthorities", email.toLowerCase());
+        const whitelistSnap = await getDoc(whitelistRef);
+        if (whitelistSnap.exists() && whitelistSnap.data().status === "active") {
+          finalRole = whitelistSnap.data().role || "authority";
+        }
+      } catch (err) {
+        console.error("Error looking up whitelist:", err);
+      }
+    }
 
     if (!userSnap.exists()) {
       await setDoc(userRef, {
@@ -54,16 +69,19 @@ export default function LoginPage() {
         displayName: firebaseUser.displayName || "Anonymous User",
         email: firebaseUser.email || "",
         photoURL: firebaseUser.photoURL || "",
-        role: "citizen",
+        role: finalRole,
         createdAt: serverTimestamp(),
         lastLogin: serverTimestamp(),
       });
-      return "citizen";
+      return finalRole;
     } else {
       await updateDoc(userRef, {
+        displayName: firebaseUser.displayName || userSnap.data().displayName || "Anonymous User",
+        photoURL: firebaseUser.photoURL || userSnap.data().photoURL || "",
         lastLogin: serverTimestamp(),
+        role: finalRole,
       });
-      return userSnap.data().role || "citizen";
+      return finalRole;
     }
   };
 
@@ -73,7 +91,19 @@ export default function LoginPage() {
     try {
       const userCredential = await signInWithEmailAndPassword(auth, data.email, data.password);
       const userRole = await upsertUser(userCredential.user);
-      if (userRole === "authority") {
+      
+      // Audit Log
+      await createAuditLog({
+        action: "Login",
+        performedByUid: userCredential.user.uid,
+        performedByName: userCredential.user.displayName || "Anonymous User",
+        performedByEmail: userCredential.user.email || "",
+        performedByRole: userRole,
+        after: { lastLogin: new Date() },
+        metadata: { loginMethod: "email" }
+      });
+
+      if (userRole === "authority" || userRole === "super_admin") {
         router.replace("/dashboard");
       } else {
         router.replace("/report");
@@ -94,7 +124,19 @@ export default function LoginPage() {
       const provider = new GoogleAuthProvider();
       const userCredential = await signInWithPopup(auth, provider);
       const userRole = await upsertUser(userCredential.user);
-      if (userRole === "authority") {
+
+      // Audit Log
+      await createAuditLog({
+        action: "Login",
+        performedByUid: userCredential.user.uid,
+        performedByName: userCredential.user.displayName || "Anonymous User",
+        performedByEmail: userCredential.user.email || "",
+        performedByRole: userRole,
+        after: { lastLogin: new Date() },
+        metadata: { loginMethod: "google" }
+      });
+
+      if (userRole === "authority" || userRole === "super_admin") {
         router.replace("/dashboard");
       } else {
         router.replace("/report");
